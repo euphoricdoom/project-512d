@@ -220,8 +220,9 @@ class LatticeLayer:
         inputs: np.ndarray,
         task_id: str | None = None,
         prev_layer_features: np.ndarray | None = None,
+        routing_weights: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Run all stacks, apply bridges, return layer features.
+        """Run all stacks, apply routing weights and bridges, return layer features.
 
         Args:
             inputs:              Raw input sequence (T, input_dim).
@@ -229,6 +230,8 @@ class LatticeLayer:
             prev_layer_features: Aggregate features from the previous layer
                                  (layer_feature_dim,). If set and input_mixing
                                  is initialised, mixes into each input timestep.
+            routing_weights:     Per-stack softmax weights (n_stacks,). If None,
+                                 uniform weights are used (backward compatible).
 
         Returns:
             Layer feature vector (n_stacks × feature_dim_per_stack,).
@@ -240,9 +243,13 @@ class LatticeLayer:
         else:
             layer_inputs = inputs
 
-        raw_features: list[np.ndarray] = [
-            stack.forward(layer_inputs, task_id=task_id) for stack in self.stacks
-        ]
+        if routing_weights is None:
+            routing_weights = np.ones(self.n_stacks) / self.n_stacks
+
+        raw_features: list[np.ndarray] = []
+        for stack_idx, stack in enumerate(self.stacks):
+            features = stack.forward(layer_inputs, task_id=task_id)
+            raw_features.append(features * routing_weights[stack_idx])
 
         blended = self._apply_bridges(raw_features)
         return np.concatenate(blended)
@@ -335,9 +342,37 @@ class KernelLattice:
             rng=readout_rng,
         )
 
+        # Learnable stack router: (n_stacks, input_dim)
+        # Maps a single input vector to per-stack softmax weights.
+        router_rng = np.random.default_rng(self.lattice_cfg.seed + 8000)
+        self.stack_router = router_rng.normal(
+            0.0, 1.0 / np.sqrt(self.kernel_cfg.input_dim),
+            size=(self.lattice_cfg.n_stacks, self.kernel_cfg.input_dim),
+        )
+        self.routing_temperature: float = 1.0
+
         self._task_sample_counts: dict[str, int] = {}
         self._total_forward_calls: int = 0
         self._training_log: list[dict[str, Any]] = []
+
+    # ------------------------------------------------------------------
+    # Routing
+    # ------------------------------------------------------------------
+
+    def route_stacks(self, input_vec: np.ndarray) -> np.ndarray:
+        """Compute stack routing weights via softmax over a single input vector.
+
+        Args:
+            input_vec: Input vector of shape (input_dim,).
+
+        Returns:
+            Routing weights (n_stacks,) that sum to 1.0.
+        """
+        input_vec = np.asarray(input_vec, dtype=float).ravel()
+        scores = self.stack_router @ input_vec / self.routing_temperature
+        scores = scores - np.max(scores)  # numerical stability
+        exp_scores = np.exp(scores)
+        return exp_scores / (np.sum(exp_scores) + 1e-12)
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -362,13 +397,19 @@ class KernelLattice:
         if inputs.ndim == 1:
             inputs = inputs[None, :]
 
+        # Routing weights computed once from the first timestep
+        routing_weights = self.route_stacks(inputs[0])
+
         self._total_forward_calls += 1
         prev_features: np.ndarray | None = None
         all_features: list[np.ndarray] = []
 
         for layer in self.layers:
             layer_features = layer.forward(
-                inputs, task_id=task_id, prev_layer_features=prev_features
+                inputs,
+                task_id=task_id,
+                prev_layer_features=prev_features,
+                routing_weights=routing_weights,
             )
             all_features.append(layer_features)
             prev_features = layer_features

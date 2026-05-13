@@ -1,6 +1,8 @@
 """Tests for system/kernel_lattice.py.
 
 Covers:
+  - Stack routing: route_stacks(), stack_router attribute, temperature
+  - Routing integration: forward() uses routing, LatticeLayer accepts weights
   - LatticeConfig validation
   - KernelStack: determinism, output shape, sequence handling
   - LatticeLayer: feature shape, bridge mechanism, feature blending
@@ -486,3 +488,81 @@ class TestFitTask:
         Y = rng.normal(size=(12, 64))
         lattice.fit_task(X, Y, task_id="counted", epochs=2)
         assert lattice._task_sample_counts["counted"] == 12
+
+
+# ---------------------------------------------------------------------------
+# Stack routing
+# ---------------------------------------------------------------------------
+
+class TestStackRouting:
+    def _make_lattice(self) -> KernelLattice:
+        cfg = Config512D(seed=42)
+        lcfg = LatticeConfig(n_layers=1, n_stacks=4, projection_dim=16, seed=42)
+        return KernelLattice(output_dim=cfg.output_dim, lattice_cfg=lcfg, kernel_cfg=cfg)
+
+    def test_stack_router_exists(self):
+        lattice = self._make_lattice()
+        assert hasattr(lattice, "stack_router")
+        assert hasattr(lattice, "route_stacks")
+        assert hasattr(lattice, "routing_temperature")
+
+    def test_stack_router_shape(self):
+        lattice = self._make_lattice()
+        cfg = Config512D(seed=42)
+        assert lattice.stack_router.shape == (lattice.lattice_cfg.n_stacks, cfg.input_dim)
+
+    def test_route_stacks_sums_to_one(self):
+        lattice = self._make_lattice()
+        cfg = Config512D(seed=42)
+        x = np.random.default_rng(0).normal(size=(cfg.input_dim,))
+        weights = lattice.route_stacks(x)
+        assert weights.shape == (lattice.lattice_cfg.n_stacks,)
+        assert np.isclose(np.sum(weights), 1.0)
+        assert np.all(weights >= 0.0)
+
+    def test_route_stacks_deterministic(self):
+        lattice = self._make_lattice()
+        cfg = Config512D(seed=42)
+        x = np.random.default_rng(7).normal(size=(cfg.input_dim,))
+        w1 = lattice.route_stacks(x)
+        w2 = lattice.route_stacks(x)
+        np.testing.assert_array_equal(w1, w2)
+
+    def test_routing_differs_for_different_inputs(self):
+        lattice = self._make_lattice()
+        cfg = Config512D(seed=42)
+        x1 = np.ones(cfg.input_dim) * 0.5
+        x2 = -np.ones(cfg.input_dim) * 0.5
+        w1 = lattice.route_stacks(x1)
+        w2 = lattice.route_stacks(x2)
+        assert not np.allclose(w1, w2)
+
+    def test_forward_still_correct_shape(self):
+        lattice = self._make_lattice()
+        x = np.random.default_rng(1).normal(size=(3, 64))
+        feat = lattice.forward(x)
+        assert feat.shape == (lattice.lattice_cfg.global_feature_dim,)
+
+    def test_zero_forgetting_preserved_with_routing(self):
+        lattice = self._make_lattice()
+        rng = np.random.default_rng(99)
+        cfg = Config512D(seed=42)
+        X_a = rng.normal(size=(10, 64))
+        Y_a = rng.normal(size=(10, cfg.output_dim))
+        X_b = rng.normal(size=(10, 64))
+        Y_b = rng.normal(size=(10, cfg.output_dim))
+
+        lattice.train_sequence(X_a, Y_a, task_id="A", lr=0.01)
+        preds_before = np.array([lattice.predict(X_a[i:i+1], "A") for i in range(len(X_a))])
+        lattice.train_sequence(X_b, Y_b, task_id="B", lr=0.01)
+        preds_after = np.array([lattice.predict(X_a[i:i+1], "A") for i in range(len(X_a))])
+        np.testing.assert_array_equal(preds_before, preds_after)
+
+    def test_layer_forward_uniform_routing_when_none(self):
+        cfg = Config512D(seed=2)
+        lcfg = LatticeConfig(n_layers=1, n_stacks=2, projection_dim=16, seed=2)
+        rng = np.random.default_rng(2)
+        layer = LatticeLayer(0, 2, cfg, lcfg, rng)
+        x = np.random.default_rng(0).normal(size=(3, 64))
+        out = layer.forward(x, routing_weights=None)
+        assert out.shape == (2 * (16 * 6 + 3),)

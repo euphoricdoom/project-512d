@@ -91,7 +91,7 @@ def run_benchmark(
         n_layers=2,
         n_stacks=4,
         projection_dim=256,
-        bridge_threshold=0.15,
+        bridge_threshold=0.40,
         bridge_alpha=0.25,
         seed=seed,
     )
@@ -118,20 +118,22 @@ def run_benchmark(
     for task in task_order:
         d = datasets[task]
         t0 = time.time()
-        losses = lattice.train_sequence(
+        # fit_task caches features once and runs mini-batch GD — converges faster
+        # than train_sequence which recomputes features each epoch
+        losses = lattice.fit_task(
             d["X_tr"], d["Y_tr"], task_id=task, lr=lr, epochs=epochs
         )
         elapsed = time.time() - t0
         test_metrics = lattice.evaluate(d["X_te"], d["Y_te"], task_id=task)
-        train_mse = float(np.mean(losses))
+        final_train_mse = losses[-1]
         train_results[task] = {
-            "train_mse": train_mse,
+            "train_mse": final_train_mse,
             "test_mse": test_metrics["mse"],
             "test_r2": test_metrics["r2"],
             "elapsed_s": round(elapsed, 2),
         }
         print(
-            f"  {task:<10}  train_mse={train_mse:.4f}  "
+            f"  {task:<10}  train_mse={final_train_mse:.4f}  "
             f"test_mse={test_metrics['mse']:.4f}  r2={test_metrics['r2']:.3f}  "
             f"({elapsed:.1f}s)"
         )
@@ -177,14 +179,16 @@ def run_benchmark(
     print("-" * 40)
     bridge_info = lattice.bridge_summary()
     activations = bridge_info["bridge_activations"]
+    hit_rates = bridge_info.get("bridge_hit_rates", {})
     if activations:
         for edge, count in sorted(activations.items(), key=lambda x: -x[1]):
-            print(f"  {edge:<30} activations={count}")
+            rate = hit_rates.get(edge, 0.0)
+            print(f"  {edge:<30} activations={count}  hit_rate={rate:.2%}")
     else:
         print("  No bridge activations recorded.")
 
     # ------------------------------------------------------------------
-    # Phase 4: Local vs Global comparison
+    # Phase 4: Local vs Global comparison (both use fit_task for fair comparison)
     # ------------------------------------------------------------------
     print()
     print("Phase 4: Local (stack 0, layer 0) vs Global readout")
@@ -196,23 +200,33 @@ def run_benchmark(
         feature_dim=lattice_cfg.feature_dim_per_stack,
         rng=np.random.default_rng(seed + 1),
     )
+    stack0 = lattice.layers[0].stacks[0]
 
     local_results: dict[str, float] = {}
     for task in task_order:
         d = datasets[task]
+        n_tr = len(d["X_tr"])
+
+        # Cache stack-0 features once
+        F_local = np.zeros((n_tr, lattice_cfg.feature_dim_per_stack))
+        for i in range(n_tr):
+            F_local[i] = stack0.forward(d["X_tr"][i][None, :], task_id=task)
+
+        # Mini-batch gradient descent on local features
         local_readout.set_task(task)
-        stack0 = lattice.layers[0].stacks[0]
-        for i in range(len(d["X_tr"])):
-            feat = stack0.forward(d["X_tr"][i][None, :], task_id=task)
-            head = local_readout._heads[task]
-            pred = head @ feat
-            err = pred - d["Y_tr"][i]
-            grad = np.outer(err, feat)
-            head -= lr * grad
-            np.clip(head, -local_readout.weight_clip, local_readout.weight_clip, out=head)
+        head = local_readout._heads[task]
+        local_rng = np.random.default_rng(seed + 2)
+        for ep in range(epochs):
+            idx = local_rng.permutation(n_tr)
+            for start in range(0, n_tr, 32):
+                b = idx[start:start + 32]
+                preds_b = F_local[b] @ head.T
+                err_b = preds_b - d["Y_tr"][b]
+                head -= lr * (err_b.T @ F_local[b]) / len(b)
+                np.clip(head, -local_readout.weight_clip, local_readout.weight_clip, out=head)
 
         preds = np.array([
-            local_readout._heads[task] @ stack0.forward(d["X_te"][i][None, :], task_id=task)
+            head @ stack0.forward(d["X_te"][i][None, :], task_id=task)
             for i in range(len(d["X_te"]))
         ])
         local_mse = float(np.mean((preds - d["Y_te"]) ** 2))
@@ -304,18 +318,14 @@ def save_plots(
     fig.savefig(out_dir / "forgetting_check.png", dpi=120)
     plt.close(fig)
 
-    # 3. Specialization heatmap
+    # 3. Specialization heatmap (read-only — no side effects on readout heads)
     n_small = 30
     X_all = np.zeros((n_tasks, n_small, 1, cfg.input_dim))
-    Y_all = np.zeros((n_tasks, n_small, cfg.output_dim))
     for ti, task in enumerate(task_order):
         d = datasets[task]
         X_all[ti, :, 0, :] = d["X_tr"][:n_small]
-        Y_all[ti, :, :] = d["Y_tr"][:n_small]
 
-    heatmap = lattice.specialization_matrix(
-        X_all, Y_all, task_order, lr=0.001
-    )
+    heatmap = lattice.specialization_matrix(X_all, task_order, n_probe=n_small)
     fig, ax = plt.subplots(figsize=(8, 4))
     im = ax.imshow(heatmap, aspect="auto", cmap="viridis")
     ax.set_xlabel("Stack index")

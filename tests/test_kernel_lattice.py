@@ -407,7 +407,82 @@ class TestAnalysis:
         tasks = ["tanh", "relu"]
         n_samp = 8
         X = rng.normal(size=(len(tasks), n_samp, 1, cfg.input_dim))
-        Y = rng.normal(size=(len(tasks), n_samp, cfg.output_dim))
-        heatmap = lattice.specialization_matrix(X, Y, tasks, lr=0.001)
+        heatmap = lattice.specialization_matrix(X, tasks, n_probe=n_samp)
         assert heatmap.shape == (lcfg.n_layers, lcfg.n_stacks)
         assert np.all(heatmap >= 0.0)
+
+    def test_specialization_matrix_no_side_effects(self):
+        lattice = self._make_trained_lattice()
+        cfg = Config512D(seed=5)
+        rng = np.random.default_rng(10)
+        tasks = ["tanh", "relu"]
+        n_samp = 5
+        X = rng.normal(size=(len(tasks), n_samp, 1, cfg.input_dim))
+
+        # Snapshot heads before
+        heads_before = {
+            tid: head.copy()
+            for tid, head in lattice.readout._heads.items()
+        }
+        n_tasks_before = len(lattice.readout._heads)
+
+        lattice.specialization_matrix(X, tasks, n_probe=n_samp)
+
+        # Heads must be identical after — no side effects
+        assert len(lattice.readout._heads) == n_tasks_before
+        for tid, head_before in heads_before.items():
+            np.testing.assert_array_equal(lattice.readout._heads[tid], head_before)
+
+    def test_bridge_summary_has_hit_rates(self):
+        lattice = self._make_trained_lattice()
+        summary = lattice.bridge_summary()
+        assert "bridge_hit_rates" in summary
+        for rate in summary["bridge_hit_rates"].values():
+            assert 0.0 <= rate <= 1.0
+
+
+class TestFitTask:
+    def _make_lattice(self) -> KernelLattice:
+        cfg = Config512D(seed=3)
+        lcfg = LatticeConfig(n_layers=1, n_stacks=2, projection_dim=16, seed=3)
+        return KernelLattice(output_dim=cfg.output_dim, lattice_cfg=lcfg, kernel_cfg=cfg)
+
+    def test_returns_per_epoch_losses(self):
+        lattice = self._make_lattice()
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(20, 64))
+        Y = rng.normal(size=(20, 64))
+        losses = lattice.fit_task(X, Y, task_id="t1", epochs=5)
+        assert len(losses) == 5
+        assert all(isinstance(l, float) for l in losses)
+
+    def test_loss_decreases(self):
+        lattice = self._make_lattice()
+        rng = np.random.default_rng(1)
+        X = rng.normal(size=(50, 64))
+        Y = np.tanh(X)
+        losses = lattice.fit_task(X, Y, task_id="tanh", lr=0.01, epochs=20)
+        assert losses[-1] < losses[0]
+
+    def test_zero_forgetting_after_fit(self):
+        lattice = self._make_lattice()
+        rng = np.random.default_rng(2)
+        cfg = Config512D(seed=3)
+        X_a = rng.normal(size=(15, 64))
+        Y_a = rng.normal(size=(15, cfg.output_dim))
+        X_b = rng.normal(size=(15, 64))
+        Y_b = rng.normal(size=(15, cfg.output_dim))
+
+        lattice.fit_task(X_a, Y_a, task_id="A", epochs=3)
+        preds_before = np.array([lattice.predict(X_a[i:i+1], "A") for i in range(len(X_a))])
+        lattice.fit_task(X_b, Y_b, task_id="B", epochs=3)
+        preds_after = np.array([lattice.predict(X_a[i:i+1], "A") for i in range(len(X_a))])
+        np.testing.assert_array_equal(preds_before, preds_after)
+
+    def test_sample_counts_tracked(self):
+        lattice = self._make_lattice()
+        rng = np.random.default_rng(3)
+        X = rng.normal(size=(12, 64))
+        Y = rng.normal(size=(12, 64))
+        lattice.fit_task(X, Y, task_id="counted", epochs=2)
+        assert lattice._task_sample_counts["counted"] == 12

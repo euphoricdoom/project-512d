@@ -66,7 +66,7 @@ class LatticeConfig:
     n_layers: int = 2
     n_stacks: int = 4
     projection_dim: int = 256
-    bridge_threshold: float = 0.15
+    bridge_threshold: float = 0.40
     bridge_alpha: float = 0.25
     seed: int = 42
 
@@ -200,9 +200,14 @@ class LatticeLayer:
         self.lattice_cfg = lattice_cfg
         self._bridge_activations: dict[str, int] = {}
 
+        from dataclasses import replace as dc_replace
         self.stacks: list[KernelStack] = [
-            KernelStack(cfg, lattice_cfg.projection_dim, rng)
-            for _ in range(n_stacks)
+            KernelStack(
+                dc_replace(cfg, seed=cfg.seed + layer_id * 1000 + stack_id),
+                lattice_cfg.projection_dim,
+                rng,
+            )
+            for stack_id in range(n_stacks)
         ]
         self.feature_dim_per_stack: int = self.stacks[0].feature_dim
 
@@ -469,6 +474,74 @@ class KernelLattice:
 
         return losses
 
+    def fit_task(
+        self,
+        X: np.ndarray,
+        Y: np.ndarray,
+        task_id: str,
+        lr: float = 0.005,
+        epochs: int = 10,
+        batch_size: int = 32,
+        verbose: bool = False,
+    ) -> list[float]:
+        """Train via cached features + mini-batch gradient descent.
+
+        Since all stacks have fixed weights and deterministic forward passes,
+        the feature vector for any input is the same every epoch. This method
+        computes features once and then runs purely linear regression across
+        multiple epochs — much faster than ``train_sequence`` for multi-epoch
+        training and converges reliably.
+
+        Args:
+            X:          Input array (n_samples, T, input_dim) or (n_samples, input_dim).
+            Y:          Target array (n_samples, output_dim).
+            task_id:    Task head to train.
+            lr:         Learning rate for mini-batch gradient descent.
+            epochs:     Number of passes over the cached features.
+            batch_size: Mini-batch size.
+            verbose:    Print per-epoch loss if True.
+
+        Returns:
+            Per-epoch mean MSE loss.
+        """
+        X = np.asarray(X, dtype=float)
+        Y = np.asarray(Y, dtype=float)
+        if X.ndim == 2:
+            X = X[:, None, :]
+        n = len(X)
+
+        # Compute features once — O(n) forward passes instead of O(n * epochs)
+        F = np.zeros((n, self.lattice_cfg.global_feature_dim))
+        for i in range(n):
+            F[i] = self.forward(X[i], task_id=task_id)
+
+        self.readout.set_task(task_id)
+        head = self.readout._heads[task_id]
+        epoch_losses: list[float] = []
+        shuffle_rng = np.random.default_rng(self.lattice_cfg.seed)
+
+        for epoch in range(epochs):
+            idx = shuffle_rng.permutation(n)
+            for start in range(0, n, batch_size):
+                b_idx = idx[start : start + batch_size]
+                F_b = F[b_idx]
+                Y_b = Y[b_idx]
+                preds = F_b @ head.T
+                errors = preds - Y_b
+                grad = errors.T @ F_b / len(b_idx)
+                head -= lr * grad
+                np.clip(head, -self.readout.weight_clip, self.readout.weight_clip, out=head)
+            # Post-update epoch loss (full pass over cached features)
+            mean_loss = float(np.mean((F @ head.T - Y) ** 2))
+            epoch_losses.append(mean_loss)
+            if verbose:
+                print(f"  epoch {epoch + 1}/{epochs}  loss={mean_loss:.4f}")
+
+        self._task_sample_counts[task_id] = (
+            self._task_sample_counts.get(task_id, 0) + n
+        )
+        return epoch_losses
+
     # ------------------------------------------------------------------
     # Evaluation
     # ------------------------------------------------------------------
@@ -506,47 +579,55 @@ class KernelLattice:
     # ------------------------------------------------------------------
 
     def bridge_summary(self) -> dict[str, Any]:
-        """Return bridge activation counts across all layers (JSON-safe keys)."""
-        summary: dict[str, int] = {}
+        """Return bridge activation counts and hit rates across all layers (JSON-safe keys)."""
+        activations: dict[str, int] = {}
         for layer in self.layers:
             for edge_key, count in layer.bridge_activation_counts().items():
-                summary[edge_key] = summary.get(edge_key, 0) + count
-        return {"bridge_activations": summary, "total_forward_calls": self._total_forward_calls}
+                activations[edge_key] = activations.get(edge_key, 0) + count
+        total = self._total_forward_calls
+        hit_rates = {
+            k: round(v / total, 4) if total > 0 else 0.0
+            for k, v in activations.items()
+        }
+        return {
+            "bridge_activations": activations,
+            "bridge_hit_rates": hit_rates,
+            "total_forward_calls": total,
+        }
 
     def specialization_matrix(
         self,
         X: np.ndarray,
-        Y: np.ndarray,
         task_ids: list[str],
-        lr: float = 0.01,
+        n_probe: int = 50,
     ) -> np.ndarray:
-        """Train each task and measure per-stack contribution via feature norms.
+        """Measure per-stack feature-norm contribution per task — read-only.
+
+        Probes the stack outputs for each task without touching any readout
+        weights. The stacks are deterministic (fixed weights, zero-init kernel),
+        so this is a pure measurement with no side effects.
 
         Args:
             X:        Array (n_tasks, n_samples, T, input_dim) or
                       (n_tasks, n_samples, input_dim).
-            Y:        Array (n_tasks, n_samples, output_dim).
             task_ids: Task name for each slice along axis 0.
-            lr:       Learning rate.
+            n_probe:  Max samples to probe per task (default 50).
 
         Returns:
-            Heatmap array (n_layers, n_stacks) with mean feature norms per
-            (layer, stack) position, averaged across all tasks.
+            Heatmap array (n_layers, n_stacks) of mean feature norms,
+            averaged across all tasks and probe samples.
         """
         n_tasks = len(task_ids)
         heatmap = np.zeros((self.lattice_cfg.n_layers, self.lattice_cfg.n_stacks))
         n_samples = X.shape[1]
+        n_probe = min(n_probe, n_samples)
 
         for ti, task_id in enumerate(task_ids):
             x_task = np.asarray(X[ti], dtype=float)
-            y_task = np.asarray(Y[ti], dtype=float)
             if x_task.ndim == 2:
                 x_task = x_task[:, None, :]
-            self.readout.set_task(task_id)
-            for i in range(n_samples):
-                self.train_sample(x_task[i], y_task[i], task_id=task_id, lr=lr)
 
-            for i in range(min(50, n_samples)):
+            for i in range(n_probe):
                 inputs = x_task[i]
                 prev_features: np.ndarray | None = None
                 for layer_id, layer in enumerate(self.layers):
@@ -563,7 +644,7 @@ class KernelLattice:
                         heatmap[layer_id, si] += float(np.linalg.norm(sf))
                     prev_features = np.concatenate(stack_features)
 
-        return heatmap / (n_tasks * min(50, n_samples))
+        return heatmap / (n_tasks * n_probe)
 
     def task_summary(self) -> dict[str, Any]:
         """Return a JSON-serialisable summary of training state."""

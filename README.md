@@ -110,11 +110,13 @@ project-512d/
 │   └── quickstart.py    # IMDB sentiment in <60 seconds
 │
 ├── core/                # Kernel network research (spectral, governance)
-├── system/              # Modular field system, helix temporal, gates
+├── system/              # Modular field system, helix temporal, kernel_lattice
+│   └── kernel_lattice.py  # 2D Kernel Lattice (vertical hierarchy + horizontal bridges)
 ├── analysis/            # Spectral, flow, stability, learning dynamics
 ├── viz/                 # Visualization modules
 ├── experiments/         # Experiment runners and benchmark scripts
-├── tests/               # Pytest test suite (25 test files, 143 tests)
+│   └── run_lattice_benchmark.py  # Continual learning benchmark on 8 tasks
+├── tests/               # Pytest test suite (26 test files, 183 tests)
 └── docs/                # Research ledger and project direction
     ├── RESEARCH_LEDGER.md
     └── PROJECT_DIRECTION.md
@@ -230,12 +232,55 @@ See `examples/quickstart.py` for a complete runnable example.
 
 No PyTorch, no CUDA, no deep learning framework required for inference.
 
+## 2D Kernel Lattice
+
+The Kernel Lattice (`system/kernel_lattice.py`) extends the zero-forgetting substrate into a 2D architecture:
+
+```
+Layer 1 (abstract)  [Stack 0] --bridge-- [Stack 1] --bridge-- [Stack 2] --bridge-- [Stack 3]
+      ^ inter-layer projection
+Layer 0 (concrete)  [Stack 0] --bridge-- [Stack 1] --bridge-- [Stack 2] --bridge-- [Stack 3]
+             ^ ^ ^ ^ input sequence (T x 64)
+```
+
+**Each stack** pairs a `ModularFieldSystem` (540-dim recurrent kernel) with a `HelixTemporalAdapter` (AC/DC trajectory features) to produce a 1539-dim feature vector per sample.
+
+**Bridges** fire when cosine similarity between adjacent stacks exceeds a threshold, blending their feature vectors. This operates on final features only — kernel state is never touched.
+
+**Vertical connections** project each layer's aggregate features back to input dimension, mixed into the next layer's timesteps.
+
+**Global readout** uses `ZeroForgetReadout` across all (2 layers × 4 stacks = 12,312) features. Zero forgetting is structural: shared dynamics are never updated during task training.
+
+```python
+from system.kernel_lattice import KernelLattice, LatticeConfig
+
+lattice = KernelLattice(output_dim=64, lattice_cfg=LatticeConfig(n_layers=2, n_stacks=4))
+
+# Train task A
+lattice.train_sequence(X_a, Y_a, task_id="task_A", lr=0.005, epochs=3)
+
+# Train task B — task A is structurally untouched
+lattice.train_sequence(X_b, Y_b, task_id="task_B", lr=0.005, epochs=3)
+
+# Evaluate
+metrics = lattice.evaluate(X_test, Y_test, task_id="task_A")
+```
+
+Run the continual-learning benchmark on all 8 tasks:
+
+```bash
+python experiments/run_lattice_benchmark.py
+python experiments/run_lattice_benchmark.py --fast   # smoke test (~10s)
+```
+
+See `docs/LATTICE_ARCHITECTURE.md` for the full design rationale.
+
 ## Research Context
 
 This project explores kernel-based neural network architectures with:
 - Spectral analysis and stability guarantees (spectral radius ≤ 0.94)
 - Governance mechanisms (attention, metabolic, oscillatory, thalamic)
-- Hierarchical network structures
+- 2D Kernel Lattice: vertical temporal hierarchy + horizontal functional specialization
 - Multi-readout continual learning
 - Projection-based task adaptation
 

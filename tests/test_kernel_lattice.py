@@ -1,8 +1,8 @@
 """Tests for system/kernel_lattice.py.
 
 Covers:
-  - Stack routing: route_stacks(), stack_router attribute, temperature
-  - Routing integration: forward() uses routing, LatticeLayer accepts weights
+  - LSHStackRouter: determinism, distribution, similar-input collision
+  - Routing integration: forward() uses LSH routing, LatticeLayer hard routing
   - LatticeConfig validation
   - KernelStack: determinism, output shape, sequence handling
   - LatticeLayer: feature shape, bridge mechanism, feature blending
@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from core.constants import Config512D
-from system.kernel_lattice import KernelLattice, KernelStack, LatticeConfig, LatticeLayer
+from system.kernel_lattice import KernelLattice, KernelStack, LatticeConfig, LatticeLayer, LSHStackRouter
 
 
 # ---------------------------------------------------------------------------
@@ -491,78 +491,122 @@ class TestFitTask:
 
 
 # ---------------------------------------------------------------------------
-# Stack routing
+# LSH stack routing
 # ---------------------------------------------------------------------------
 
-class TestStackRouting:
-    def _make_lattice(self) -> KernelLattice:
+class TestLSHStackRouter:
+    def _make_router(self, n_stacks: int = 4, n_projections: int = 8) -> LSHStackRouter:
+        return LSHStackRouter(n_stacks=n_stacks, input_dim=64, n_projections=n_projections, seed=42)
+
+    def test_lsh_router_exists_on_lattice(self):
         cfg = Config512D(seed=42)
         lcfg = LatticeConfig(n_layers=1, n_stacks=4, projection_dim=16, seed=42)
-        return KernelLattice(output_dim=cfg.output_dim, lattice_cfg=lcfg, kernel_cfg=cfg)
-
-    def test_stack_router_exists(self):
-        lattice = self._make_lattice()
+        lattice = KernelLattice(output_dim=cfg.output_dim, lattice_cfg=lcfg, kernel_cfg=cfg)
         assert hasattr(lattice, "stack_router")
-        assert hasattr(lattice, "route_stacks")
-        assert hasattr(lattice, "routing_temperature")
+        assert isinstance(lattice.stack_router, LSHStackRouter)
 
-    def test_stack_router_shape(self):
-        lattice = self._make_lattice()
+    def test_lsh_route_returns_valid_stack_index(self):
+        router = self._make_router(n_stacks=4)
+        x = np.random.default_rng(0).normal(size=(64,))
+        idx = router.route(x)
+        assert isinstance(idx, int)
+        assert 0 <= idx < 4
+
+    def test_lsh_routing_deterministic(self):
+        router = self._make_router(n_stacks=4)
+        x = np.random.default_rng(7).normal(size=(64,))
+        assert router.route(x) == router.route(x)
+
+    def test_lsh_routing_distributes_across_stacks(self):
+        router = self._make_router(n_stacks=4)
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(200, 64))
+        indices = np.array([router.route(x) for x in X])
+        unique = set(indices.tolist())
+        # With 200 samples and 4 stacks, all stacks should be visited
+        assert len(unique) == 4
+
+    def test_lsh_similar_inputs_same_stack(self):
+        router = self._make_router(n_stacks=4)
+        x = np.random.default_rng(5).normal(size=(64,))
+        noise = np.random.default_rng(5).normal(size=(64,)) * 1e-6
+        x_similar = x + noise
+        # Nearly identical vectors must hash identically
+        assert router.route(x) == router.route(x_similar)
+
+    def test_lsh_different_inputs_can_differ(self):
+        router = self._make_router(n_stacks=4)
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(20, 64))
+        indices = [router.route(x) for x in X]
+        # Not all inputs route to the same stack
+        assert len(set(indices)) > 1
+
+    def test_lsh_route_batch_matches_route(self):
+        router = self._make_router(n_stacks=4)
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(30, 64))
+        batch_indices = router.route_batch(X)
+        single_indices = np.array([router.route(x) for x in X])
+        np.testing.assert_array_equal(batch_indices, single_indices)
+
+    def test_lsh_hash_input_range(self):
+        router = self._make_router(n_stacks=4, n_projections=8)
+        x = np.random.default_rng(0).normal(size=(64,))
+        h = router.hash_input(x)
+        assert 0 <= h < 2 ** 8
+
+    def test_forward_uses_hard_routing_correct_shape(self):
         cfg = Config512D(seed=42)
-        assert lattice.stack_router.shape == (lattice.lattice_cfg.n_stacks, cfg.input_dim)
-
-    def test_route_stacks_sums_to_one(self):
-        lattice = self._make_lattice()
-        cfg = Config512D(seed=42)
-        x = np.random.default_rng(0).normal(size=(cfg.input_dim,))
-        weights = lattice.route_stacks(x)
-        assert weights.shape == (lattice.lattice_cfg.n_stacks,)
-        assert np.isclose(np.sum(weights), 1.0)
-        assert np.all(weights >= 0.0)
-
-    def test_route_stacks_deterministic(self):
-        lattice = self._make_lattice()
-        cfg = Config512D(seed=42)
-        x = np.random.default_rng(7).normal(size=(cfg.input_dim,))
-        w1 = lattice.route_stacks(x)
-        w2 = lattice.route_stacks(x)
-        np.testing.assert_array_equal(w1, w2)
-
-    def test_routing_differs_for_different_inputs(self):
-        lattice = self._make_lattice()
-        cfg = Config512D(seed=42)
-        x1 = np.ones(cfg.input_dim) * 0.5
-        x2 = -np.ones(cfg.input_dim) * 0.5
-        w1 = lattice.route_stacks(x1)
-        w2 = lattice.route_stacks(x2)
-        assert not np.allclose(w1, w2)
-
-    def test_forward_still_correct_shape(self):
-        lattice = self._make_lattice()
+        lcfg = LatticeConfig(n_layers=1, n_stacks=4, projection_dim=16, seed=42)
+        lattice = KernelLattice(output_dim=cfg.output_dim, lattice_cfg=lcfg, kernel_cfg=cfg)
         x = np.random.default_rng(1).normal(size=(3, 64))
         feat = lattice.forward(x)
-        assert feat.shape == (lattice.lattice_cfg.global_feature_dim,)
+        assert feat.shape == (lcfg.global_feature_dim,)
 
-    def test_zero_forgetting_preserved_with_routing(self):
-        lattice = self._make_lattice()
-        rng = np.random.default_rng(99)
+    def test_zero_forgetting_preserved_with_lsh_routing(self):
         cfg = Config512D(seed=42)
+        lcfg = LatticeConfig(n_layers=1, n_stacks=4, projection_dim=16, seed=42)
+        lattice = KernelLattice(output_dim=cfg.output_dim, lattice_cfg=lcfg, kernel_cfg=cfg)
+        rng = np.random.default_rng(99)
         X_a = rng.normal(size=(10, 64))
         Y_a = rng.normal(size=(10, cfg.output_dim))
         X_b = rng.normal(size=(10, 64))
         Y_b = rng.normal(size=(10, cfg.output_dim))
-
         lattice.train_sequence(X_a, Y_a, task_id="A", lr=0.01)
         preds_before = np.array([lattice.predict(X_a[i:i+1], "A") for i in range(len(X_a))])
         lattice.train_sequence(X_b, Y_b, task_id="B", lr=0.01)
         preds_after = np.array([lattice.predict(X_a[i:i+1], "A") for i in range(len(X_a))])
         np.testing.assert_array_equal(preds_before, preds_after)
 
-    def test_layer_forward_uniform_routing_when_none(self):
+    def test_layer_forward_all_stacks_active_when_no_target(self):
         cfg = Config512D(seed=2)
         lcfg = LatticeConfig(n_layers=1, n_stacks=2, projection_dim=16, seed=2)
         rng = np.random.default_rng(2)
         layer = LatticeLayer(0, 2, cfg, lcfg, rng)
         x = np.random.default_rng(0).normal(size=(3, 64))
-        out = layer.forward(x, routing_weights=None)
+        out = layer.forward(x, target_stack_id=None)
         assert out.shape == (2 * (16 * 6 + 3),)
+        # All stacks active — non-zero output
+        assert np.any(out != 0.0)
+
+    def test_layer_forward_inactive_stacks_zero(self):
+        cfg = Config512D(seed=2)
+        lcfg = LatticeConfig(n_layers=1, n_stacks=2, projection_dim=16, seed=2)
+        rng = np.random.default_rng(2)
+        layer = LatticeLayer(0, 2, cfg, lcfg, rng)
+        x = np.random.default_rng(0).normal(size=(3, 64))
+        feat_dim = 16 * 6 + 3
+        out = layer.forward(x, target_stack_id=0)
+        # Stack 1 (second half) should be zero
+        assert np.all(out[feat_dim:] == 0.0)
+
+    def test_analyze_routing_distribution_returns_all_tasks(self):
+        cfg = Config512D(seed=42)
+        lcfg = LatticeConfig(n_layers=1, n_stacks=4, projection_dim=16, seed=42)
+        lattice = KernelLattice(output_dim=cfg.output_dim, lattice_cfg=lcfg, kernel_cfg=cfg)
+        tasks = ["tanh", "relu", "abs"]
+        info = lattice.analyze_routing_distribution(tasks, n_samples=20)
+        assert set(info["task_distributions"].keys()) == set(tasks)
+        assert info["n_stacks"] == 4
+        assert 0.0 <= info["balance_score"] <= 1.0

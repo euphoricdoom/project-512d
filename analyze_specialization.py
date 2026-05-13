@@ -1,7 +1,7 @@
-"""Analyze stack specialization patterns via routing.
+"""Analyze LSH-based stack routing distribution.
 
-Generates a Task x Stack heatmap showing which tasks prefer which stacks,
-and reports routing entropy as a measure of specialization strength.
+Generates per-task routing histograms showing which stacks each task's inputs
+hash to, and reports a balance score as a measure of LSH uniformity.
 
 Usage::
 
@@ -25,92 +25,41 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from core.constants import Config512D
-from experiments.run_4_kernel_network import make_extended_dataset
 from system.kernel_lattice import KernelLattice, LatticeConfig
 
 OUTPUTS_DIR = Path(__file__).parent / "outputs"
 TASKS = ["tanh", "smooth", "cumsum", "edge", "relu", "sigmoid", "abs", "square"]
 
 
-def _entropy(weights: np.ndarray) -> float:
-    w = weights / (weights.sum() + 1e-12)
-    return float(-np.sum(w * np.log(w + 1e-12)))
+def plot_routing_distribution(routing_info: dict, output_path: Path) -> None:
+    """Bar chart: for each task, show how many samples routed to each stack."""
+    tasks = list(routing_info["task_distributions"].keys())
+    n_stacks = routing_info["n_stacks"]
+    n_tasks = len(tasks)
 
+    fig, axes = plt.subplots(2, 4, figsize=(14, 6), sharey=False)
+    axes = axes.ravel()
+    colors = plt.cm.tab10(np.linspace(0, 1, n_stacks))
 
-def analyze_routing_specialization(lattice, tasks, n_samples=50):
-    """Return (affinity, sharpness) where:
+    for i, task in enumerate(tasks):
+        ax = axes[i]
+        counts = routing_info["task_distributions"][task]
+        preferred = routing_info["task_preferred_stacks"][task]
+        ax.bar(range(n_stacks), counts, color=colors)
+        ax.set_title(f"{task}\n(→ Stack {preferred})", fontsize=10)
+        ax.set_xlabel("Stack", fontsize=9)
+        ax.set_ylabel("Count", fontsize=9)
+        ax.set_xticks(range(n_stacks))
 
-    affinity  — (n_tasks, n_stacks) mean routing weights across samples.
-                Near-uniform pre-training; task-differentiated after training.
-    sharpness — (n_tasks,) mean per-sample routing entropy.
-                Low = router makes confident per-sample choices (good).
-                High = near-uniform per sample (router not yet trained).
-    """
-    cfg = lattice.kernel_cfg
-    rng = np.random.default_rng(cfg.seed + 9000)
-    n_stacks = lattice.lattice_cfg.n_stacks
-    affinity = np.zeros((len(tasks), n_stacks))
-    sharpness = np.zeros(len(tasks))
+    for i in range(n_tasks, len(axes)):
+        axes[i].set_visible(False)
 
-    print("\nAnalyzing stack routing preferences...")
-    for t_idx, task in enumerate(tasks):
-        print(f"  {task:<12}", end="", flush=True)
-        X, _ = make_extended_dataset(cfg, task, rng, n_samples)
-        task_weights = np.array([lattice.route_stacks(x) for x in X])
-        mean_weights = task_weights.mean(axis=0)
-        sample_entropies = np.array([_entropy(w) for w in task_weights])
-        mean_sample_entropy = float(sample_entropies.mean())
-        affinity[t_idx] = mean_weights
-        sharpness[t_idx] = mean_sample_entropy
-        preferred = int(np.argmax(mean_weights))
-        max_ent = np.log(n_stacks)
-        sharpness_pct = 1.0 - mean_sample_entropy / max_ent
-        print(f"-> Stack {preferred}  (mean_w={mean_weights[preferred]:.3f}  "
-              f"per-sample sharpness={sharpness_pct:.1%})")
-    return affinity, sharpness
-
-
-def compute_specialization_metrics(affinity, sharpness, tasks):
-    n_stacks = affinity.shape[1]
-    max_entropy = float(np.log(n_stacks))
-    # Task-level: entropy of MEAN routing (measures cross-task differentiation)
-    mean_affinity_entropies = {task: _entropy(affinity[i]) for i, task in enumerate(tasks)}
-    # Sample-level: mean per-sample entropy (measures how sharp routing is per input)
-    mean_sample_entropy = float(sharpness.mean())
-    preferred_stacks = {task: int(np.argmax(affinity[i])) for i, task in enumerate(tasks)}
-    stack_task_counts = {
-        f"stack_{j}": int(np.sum(np.argmax(affinity, axis=1) == j))
-        for j in range(n_stacks)
-    }
-    return {
-        "mean_affinity_entropies": mean_affinity_entropies,
-        "mean_sample_entropy": mean_sample_entropy,
-        "max_entropy": max_entropy,
-        "per_sample_sharpness": float(1.0 - mean_sample_entropy / (max_entropy + 1e-12)),
-        "preferred_stacks": preferred_stacks,
-        "stack_task_counts": stack_task_counts,
-    }
-
-
-def plot_task_stack_heatmap(affinity, tasks, output_path):
-    n_stacks = affinity.shape[1]
-    fig, ax = plt.subplots(figsize=(8, 6))
-    im = ax.imshow(affinity, cmap="hot", aspect="auto", vmin=0)
-    ax.set_xticks(range(n_stacks))
-    ax.set_xticklabels([f"Stack {i}" for i in range(n_stacks)])
-    ax.set_yticks(range(len(tasks)))
-    ax.set_yticklabels(tasks)
-    ax.set_xlabel("Stack ID", fontsize=12)
-    ax.set_ylabel("Task", fontsize=12)
-    ax.set_title("Task -> Stack Routing Specialization", fontsize=14)
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label("Mean Routing Weight", fontsize=11)
-    for i in range(len(tasks)):
-        for j in range(n_stacks):
-            ax.text(j, i, f"{affinity[i, j]:.3f}",
-                    ha="center", va="center",
-                    color="white" if affinity[i, j] > affinity.max() * 0.5 else "black",
-                    fontsize=9)
+    balance = routing_info["balance_score"]
+    fig.suptitle(
+        f"LSH Stack Routing Distribution  (balance={balance:.2f})",
+        fontsize=13,
+        fontweight="bold",
+    )
     plt.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -122,56 +71,72 @@ def main():
     parser.add_argument("--n-samples", type=int, default=50)
     parser.add_argument("--n-stacks", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=2)
+    parser.add_argument("--n-projections", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-plots", action="store_true")
     args = parser.parse_args()
 
     print("=" * 70)
-    print("TASK -> STACK ROUTING SPECIALIZATION ANALYSIS")
+    print("LSH STACK ROUTING DISTRIBUTION ANALYSIS")
     print("=" * 70)
 
-    lattice_cfg = LatticeConfig(n_layers=args.n_layers, n_stacks=args.n_stacks, seed=args.seed)
+    lattice_cfg = LatticeConfig(
+        n_layers=args.n_layers, n_stacks=args.n_stacks, seed=args.seed
+    )
     kernel_cfg = Config512D(seed=args.seed)
     print(f"\nInitializing lattice ({args.n_layers} layers x {args.n_stacks} stacks)...")
-    lattice = KernelLattice(output_dim=kernel_cfg.output_dim, lattice_cfg=lattice_cfg, kernel_cfg=kernel_cfg)
+    print(f"  LSH projections: {args.n_projections}")
+    lattice = KernelLattice(
+        output_dim=kernel_cfg.output_dim,
+        lattice_cfg=lattice_cfg,
+        kernel_cfg=kernel_cfg,
+    )
 
-    affinity, sharpness = analyze_routing_specialization(lattice, TASKS, n_samples=args.n_samples)
-    metrics = compute_specialization_metrics(affinity, sharpness, TASKS)
+    print(f"\nRouting {args.n_samples} samples per task ({len(TASKS)} tasks)...\n")
+    routing_info = lattice.analyze_routing_distribution(
+        TASKS, n_samples=args.n_samples
+    )
 
     OUTPUTS_DIR.mkdir(exist_ok=True)
-    metrics_path = OUTPUTS_DIR / "routing_specialization_metrics.json"
+    metrics_path = OUTPUTS_DIR / "lsh_routing_distribution.json"
     with open(metrics_path, "w") as f:
-        json.dump({"affinity_matrix": affinity.tolist(), "tasks": TASKS, "n_stacks": args.n_stacks, "metrics": metrics}, f, indent=2)
+        json.dump(routing_info, f, indent=2)
 
     if not args.no_plots:
         try:
-            plot_task_stack_heatmap(affinity, TASKS, OUTPUTS_DIR / "task_stack_routing_specialization.png")
+            plot_routing_distribution(
+                routing_info, OUTPUTS_DIR / "lsh_routing_distribution.png"
+            )
         except Exception as e:
             print(f"[warn] Plot failed: {e}")
 
-    max_ent = metrics["max_entropy"]
-    print()
     print("=" * 70)
-    print("SPECIALIZATION METRICS")
+    print("LSH ROUTING RESULTS")
     print("=" * 70)
-    print(f"\n  Per-sample routing sharpness : {metrics['per_sample_sharpness']:.1%}")
-    print(f"  (0% = uniform per sample, 100% = always routes to one stack)")
-    print(f"  Max entropy (uniform)        : {max_ent:.3f}")
-    print(f"  Mean per-sample entropy      : {metrics['mean_sample_entropy']:.3f}")
+    print(f"\n  Balance score: {routing_info['balance_score']:.3f}")
+    print(f"  (1.0 = perfectly uniform, 0.0 = all samples on one stack)\n")
+    print(f"  Task -> Preferred Stack (by sample count):")
+    for task, preferred in routing_info["task_preferred_stacks"].items():
+        counts = routing_info["task_distributions"][task]
+        total = sum(counts)
+        pct = counts[preferred] / total * 100 if total > 0 else 0.0
+        dist_str = "  ".join(f"s{i}={c}" for i, c in enumerate(counts))
+        print(f"    {task:<12} -> Stack {preferred}  ({pct:.0f}%)  [{dist_str}]")
     print()
-    print("  Task -> Preferred Stack (by mean affinity):")
-    for task, stack in metrics["preferred_stacks"].items():
-        ent = metrics["mean_affinity_entropies"][task]
-        print(f"    {task:<12} -> Stack {stack}  (affinity_entropy={ent:.3f})")
+    print("  Stack load distribution (total samples across all tasks):")
+    n_stacks = routing_info["n_stacks"]
+    totals = [0] * n_stacks
+    for counts in routing_info["task_distributions"].values():
+        for i, c in enumerate(counts):
+            totals[i] += c
+    grand_total = sum(totals)
+    for i, t in enumerate(totals):
+        bar = "#" * int(t / max(totals) * 30) if max(totals) > 0 else ""
+        pct = t / grand_total * 100 if grand_total > 0 else 0.0
+        print(f"    Stack {i}: {bar} ({t}, {pct:.1f}%)")
     print()
-    print("  Stack task distribution:")
-    for sk, count in metrics["stack_task_counts"].items():
-        bar = "#" * count
-        print(f"    {sk}: {bar} ({count})")
-    print()
-    print(f"  Note: mean affinity is near-uniform pre-training (expected).")
-    print(f"  Per-sample sharpness shows the router IS content-sensitive.")
-    print(f"  Train stack_router via gradient descent to lock task preferences.")
+    print(f"  Note: LSH routing is deterministic and requires no training.")
+    print(f"  Similar inputs hash to the same stack, creating structural specialization.")
     print()
     print(f"  Metrics saved: {metrics_path}")
     print("=" * 70)

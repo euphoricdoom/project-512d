@@ -220,9 +220,9 @@ class LatticeLayer:
         inputs: np.ndarray,
         task_id: str | None = None,
         prev_layer_features: np.ndarray | None = None,
-        routing_weights: np.ndarray | None = None,
+        target_stack_id: int | None = None,
     ) -> np.ndarray:
-        """Run all stacks, apply routing weights and bridges, return layer features.
+        """Run all stacks with hard LSH routing, apply bridges, return layer features.
 
         Args:
             inputs:              Raw input sequence (T, input_dim).
@@ -230,8 +230,9 @@ class LatticeLayer:
             prev_layer_features: Aggregate features from the previous layer
                                  (layer_feature_dim,). If set and input_mixing
                                  is initialised, mixes into each input timestep.
-            routing_weights:     Per-stack softmax weights (n_stacks,). If None,
-                                 uniform weights are used (backward compatible).
+            target_stack_id:     Index of the active stack (LSH-assigned). All
+                                 other stacks return zero features. If None,
+                                 all stacks run (uniform, for analysis/probing).
 
         Returns:
             Layer feature vector (n_stacks × feature_dim_per_stack,).
@@ -243,13 +244,13 @@ class LatticeLayer:
         else:
             layer_inputs = inputs
 
-        if routing_weights is None:
-            routing_weights = np.ones(self.n_stacks) / self.n_stacks
-
         raw_features: list[np.ndarray] = []
         for stack_idx, stack in enumerate(self.stacks):
-            features = stack.forward(layer_inputs, task_id=task_id)
-            raw_features.append(features * routing_weights[stack_idx])
+            if target_stack_id is None or stack_idx == target_stack_id:
+                features = stack.forward(layer_inputs, task_id=task_id)
+            else:
+                features = np.zeros(stack.feature_dim)
+            raw_features.append(features)
 
         blended = self._apply_bridges(raw_features)
         return np.concatenate(blended)
@@ -281,6 +282,90 @@ class LatticeLayer:
 
     def bridge_activation_counts(self) -> dict[str, int]:
         return dict(self._bridge_activations)
+
+
+# ---------------------------------------------------------------------------
+# LSHStackRouter
+# ---------------------------------------------------------------------------
+
+class LSHStackRouter:
+    """Locality-Sensitive Hashing router: maps input vectors to stack indices.
+
+    Uses random hyperplane projections (SimHash). The sign of each projection
+    gives one bit; those bits form an integer hash that maps deterministically
+    to a stack. Similar inputs land on the same hyperplane side → same hash →
+    same stack. No learning required — specialization emerges from structure.
+
+    Args:
+        n_stacks:      Number of stacks to route between.
+        input_dim:     Dimensionality of the input vectors.
+        n_projections: Number of random hyperplanes (hash bits). More bits →
+                       finer hash space, more uniform distribution.
+        seed:          RNG seed for reproducible projection matrix.
+    """
+
+    def __init__(
+        self,
+        n_stacks: int,
+        input_dim: int,
+        n_projections: int = 8,
+        seed: int = 42,
+    ) -> None:
+        self.n_stacks = n_stacks
+        self.input_dim = input_dim
+        self.n_projections = n_projections
+        rng = np.random.default_rng(seed + 7777)
+        # Normalized random hyperplanes: (n_projections, input_dim)
+        raw = rng.standard_normal((n_projections, input_dim))
+        norms = np.linalg.norm(raw, axis=1, keepdims=True)
+        self.projections: np.ndarray = raw / (norms + 1e-12)
+
+    def hash_input(self, x: np.ndarray) -> int:
+        """Map input vector to an integer hash via sign bits.
+
+        Args:
+            x: Input vector of shape (input_dim,) or broadcastable.
+
+        Returns:
+            Non-negative integer in [0, 2**n_projections).
+        """
+        x = np.asarray(x, dtype=float).ravel()
+        # Normalize input for rotation-invariant hashing
+        norm = np.linalg.norm(x)
+        x_norm = x / (norm + 1e-12)
+        bits = (self.projections @ x_norm) >= 0.0
+        # Binary-to-integer via bit shifts
+        powers = 1 << np.arange(self.n_projections)
+        return int(np.dot(bits.astype(np.int64), powers))
+
+    def route(self, x: np.ndarray) -> int:
+        """Map input vector to a stack index in [0, n_stacks).
+
+        Args:
+            x: Input vector of shape (input_dim,).
+
+        Returns:
+            Stack index (deterministic for identical inputs).
+        """
+        return self.hash_input(x) % self.n_stacks
+
+    def route_batch(self, X: np.ndarray) -> np.ndarray:
+        """Map a batch of input vectors to stack indices.
+
+        Args:
+            X: Array of shape (n_samples, input_dim).
+
+        Returns:
+            Integer array of shape (n_samples,) with values in [0, n_stacks).
+        """
+        X = np.asarray(X, dtype=float)
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        X_norm = X / (norms + 1e-12)
+        # (n_samples, n_projections) sign matrix
+        signs = (X_norm @ self.projections.T) >= 0.0
+        powers = 1 << np.arange(self.n_projections)
+        hashes = signs.astype(np.int64) @ powers
+        return hashes % self.n_stacks
 
 
 # ---------------------------------------------------------------------------
@@ -342,37 +427,17 @@ class KernelLattice:
             rng=readout_rng,
         )
 
-        # Learnable stack router: (n_stacks, input_dim)
-        # Maps a single input vector to per-stack softmax weights.
-        router_rng = np.random.default_rng(self.lattice_cfg.seed + 8000)
-        self.stack_router = router_rng.normal(
-            0.0, 1.0 / np.sqrt(self.kernel_cfg.input_dim),
-            size=(self.lattice_cfg.n_stacks, self.kernel_cfg.input_dim),
+        # LSH stack router — deterministic, no learning required
+        self.stack_router = LSHStackRouter(
+            n_stacks=self.lattice_cfg.n_stacks,
+            input_dim=self.kernel_cfg.input_dim,
+            n_projections=8,
+            seed=self.lattice_cfg.seed,
         )
-        self.routing_temperature: float = 1.0
 
         self._task_sample_counts: dict[str, int] = {}
         self._total_forward_calls: int = 0
         self._training_log: list[dict[str, Any]] = []
-
-    # ------------------------------------------------------------------
-    # Routing
-    # ------------------------------------------------------------------
-
-    def route_stacks(self, input_vec: np.ndarray) -> np.ndarray:
-        """Compute stack routing weights via softmax over a single input vector.
-
-        Args:
-            input_vec: Input vector of shape (input_dim,).
-
-        Returns:
-            Routing weights (n_stacks,) that sum to 1.0.
-        """
-        input_vec = np.asarray(input_vec, dtype=float).ravel()
-        scores = self.stack_router @ input_vec / self.routing_temperature
-        scores = scores - np.max(scores)  # numerical stability
-        exp_scores = np.exp(scores)
-        return exp_scores / (np.sum(exp_scores) + 1e-12)
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -383,7 +448,12 @@ class KernelLattice:
         inputs: np.ndarray,
         task_id: str | None = None,
     ) -> np.ndarray:
-        """Full forward pass through all layers.
+        """Full forward pass through all layers with LSH-based hard routing.
+
+        The first timestep of the input sequence is hashed to select one
+        active stack per layer. All other stacks in that layer return zero
+        features. Specialization emerges from which inputs hash to which
+        stacks — no learning required.
 
         Args:
             inputs:  Input sequence of shape (T, input_dim=64) or (input_dim,)
@@ -397,8 +467,8 @@ class KernelLattice:
         if inputs.ndim == 1:
             inputs = inputs[None, :]
 
-        # Routing weights computed once from the first timestep
-        routing_weights = self.route_stacks(inputs[0])
+        # Hard routing: one stack active per layer, determined by input hash
+        target_stack_id = self.stack_router.route(inputs[0])
 
         self._total_forward_calls += 1
         prev_features: np.ndarray | None = None
@@ -409,7 +479,7 @@ class KernelLattice:
                 inputs,
                 task_id=task_id,
                 prev_layer_features=prev_features,
-                routing_weights=routing_weights,
+                target_stack_id=target_stack_id,
             )
             all_features.append(layer_features)
             prev_features = layer_features
@@ -686,6 +756,60 @@ class KernelLattice:
                     prev_features = np.concatenate(stack_features)
 
         return heatmap / (n_tasks * n_probe)
+
+    def analyze_routing_distribution(
+        self,
+        tasks: list[str],
+        n_samples: int = 100,
+        rng: np.random.Generator | None = None,
+    ) -> dict[str, Any]:
+        """Analyze how LSH routing distributes tasks across stacks.
+
+        For each task, draws n_samples inputs, routes them, and counts how many
+        land on each stack. Reports the distribution and a balance score
+        (1.0 = perfectly uniform, 0.0 = all on one stack).
+
+        Args:
+            tasks:     List of task names to sample inputs for.
+            n_samples: Number of samples per task.
+            rng:       Optional RNG; defaults to seed-based generator.
+
+        Returns:
+            Dict with keys:
+              - "task_distributions": {task: [count_per_stack]}
+              - "task_preferred_stacks": {task: dominant_stack_idx}
+              - "balance_score": float in [0, 1] (mean across tasks)
+              - "n_stacks": int
+        """
+        from experiments.run_4_kernel_network import make_extended_dataset
+
+        if rng is None:
+            rng = np.random.default_rng(self.lattice_cfg.seed + 5555)
+
+        n_stacks = self.lattice_cfg.n_stacks
+        task_distributions: dict[str, list[int]] = {}
+        task_preferred: dict[str, int] = {}
+        balance_scores: list[float] = []
+
+        for task in tasks:
+            X, _ = make_extended_dataset(self.kernel_cfg, task, rng, n_samples)
+            counts = np.zeros(n_stacks, dtype=int)
+            for x in X:
+                stack_idx = self.stack_router.route(x)
+                counts[stack_idx] += 1
+            task_distributions[task] = counts.tolist()
+            task_preferred[task] = int(np.argmax(counts))
+            # Balance: ratio of min to max count (1=perfect, 0=all one stack)
+            max_c = counts.max()
+            min_c = counts.min()
+            balance_scores.append(float(min_c / max_c) if max_c > 0 else 1.0)
+
+        return {
+            "task_distributions": task_distributions,
+            "task_preferred_stacks": task_preferred,
+            "balance_score": float(np.mean(balance_scores)),
+            "n_stacks": n_stacks,
+        }
 
     def task_summary(self) -> dict[str, Any]:
         """Return a JSON-serialisable summary of training state."""

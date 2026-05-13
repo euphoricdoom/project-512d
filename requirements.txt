@@ -1,0 +1,12 @@
+numpy>=1.26.4
+scipy>=1.17.1
+scikit-learn>=1.8.0
+networkx>=3.1
+matplotlib>=3.10.8
+datasets>=2.0.0
+
+# Development / testing
+pytest>=8.0.0
+
+# Optional: memory profiling for benchmark_int8.py
+# psutil>=5.9.0

@@ -1,0 +1,3 @@
+from .module_plots import plot_module_activations, plot_coupling_heatmap, plot_state_evolution, plot_routing_weights
+from .spectral_plots import plot_eigenspectrum, plot_eigenmode_structure, plot_lyapunov_spectrum, plot_participation_ratio, plot_mode_simulation
+from .dynamics_plots import plot_trace_evolution, plot_propagation_heatmap, plot_learning_curve

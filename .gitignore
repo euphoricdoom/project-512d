@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.lcov
+
+# Outputs (figures, results — directory kept via outputs/.gitignore)
+outputs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Model files — large binary artifacts; re-generate with reproduce.py or train_hf.py
+# Uncomment the lines below if you want to exclude pre-trained models from git:
+# *.npz
+# *.vocab
+# *.json
